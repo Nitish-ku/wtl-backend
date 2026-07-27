@@ -22,8 +22,12 @@ function validatePayload(body) {
   const phone = typeof body.phone === 'string' ? body.phone.trim() : '';
   const chronotype = typeof body.chronotype === 'string' ? body.chronotype : '';
 
+  // .trim() only strips regular whitespace, not zero-width Unicode (e.g. U+200B), so a name
+  // made entirely of zero-width characters would otherwise survive as "non-empty".
+  const nameHasVisibleChars = name.replace(new RegExp('[\\u200B-\\u200D\\uFEFF\\s]', 'g'), '').length > 0;
+
   const errors = [];
-  if (!name) errors.push('name is required');
+  if (!name || !nameHasVisibleChars) errors.push('name is required');
   else if (name.length > NAME_MAX_LEN) errors.push(`name must be ${NAME_MAX_LEN} characters or fewer`);
 
   if (!email) errors.push('email is required');
@@ -57,6 +61,11 @@ const RATE_LIMIT_MAX = 60; // max submissions per IP per window, per instance
 const IDENTITY_RATE_LIMIT_MAX = 5; // max submissions per email+phone combo per window, per instance
 const rateLimitHits = new Map(); // ip -> timestamps[]
 const identityRateLimitHits = new Map(); // "email|phone" -> timestamps[]
+// Hard ceiling on distinct keys tracked per Map, independent of the periodic sweep below.
+// identityRateLimitHits is keyed on attacker-controlled "email|phone" strings (up to ~267
+// chars each), so sustained fake-but-well-formed submissions from distinct identities could
+// otherwise grow this Map's key count unbounded within a single 10-minute window.
+const RATE_LIMIT_MAX_TRACKED_KEYS = 5000;
 
 // Bounds the stored timestamp array after every check (previously unbounded, which made the
 // per-request .filter() get slower and slower under sustained traffic from one key, verified
@@ -64,6 +73,18 @@ const identityRateLimitHits = new Map(); // "email|phone" -> timestamps[]
 // single-threaded this stalled every other route too, not just registration).
 function checkAndRecordHit(map, key, max) {
   const now = Date.now();
+  const isNewKey = !map.has(key);
+  if (isNewKey && map.size >= RATE_LIMIT_MAX_TRACKED_KEYS) {
+    // Evict the oldest-inserted entries (Map iteration preserves insertion order, and re-setting
+    // an existing key doesn't move it) to make room for this new key.
+    const evictCount = map.size - RATE_LIMIT_MAX_TRACKED_KEYS + 1;
+    const it = map.keys();
+    for (let i = 0; i < evictCount; i++) {
+      const oldestKey = it.next().value;
+      if (oldestKey === undefined) break;
+      map.delete(oldestKey);
+    }
+  }
   const recent = (map.get(key) || []).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
   recent.push(now);
   map.set(key, recent.slice(-(max + 1)));
@@ -115,6 +136,82 @@ async function generateUniqueRefCode(db) {
   // Extremely unlikely fallback (5 straight collisions): append a timestamp
   // slice so this never blocks a registration outright.
   return `${randomRefCode().slice(0, 4)}${Date.now().toString(36).slice(-2).toUpperCase()}`;
+}
+
+// Guards store their target registration doc's path as a plain string (regDocRef.path), written
+// only by our own code, but validated defensively before feeding it back into db.doc() during
+// the transactional read below, since a Firestore document path must be a non-empty, even
+// number of '/'-separated segments (collection/doc/collection/doc/...).
+function isValidDocPath(path) {
+  if (typeof path !== 'string' || !path) return false;
+  const rawSegments = path.split('/');
+  const segments = rawSegments.filter(Boolean);
+  // Pinned to the exact shape a guard can legitimately point at (registrations/{autoId}), not just
+  // "any even-segment path", since this string gets fed back into db.doc() below.
+  return segments.length === 2 && segments.length === rawSegments.length && segments[0] === 'registrations';
+}
+
+// Atomically checks-and-writes the duplicate guard as a single Firestore transaction, replacing
+// the old batch-create / catch ALREADY_EXISTS / separate non-transactional recovery pass. A
+// Firestore transaction gives real optimistic-concurrency guarantees: if any doc read here (the
+// guards, or the registration doc a guard points to) gets written by another transaction before
+// this one commits, the SDK automatically retries this entire function body. That's what closes
+// the race the old two-step approach had: two near-simultaneous requests can no longer both
+// observe "this guard is stale" and both win, because whichever transaction commits second is
+// forced to retry against the first transaction's freshly-written guard.
+//
+// Handles all three cases in one atomic unit: fresh registration, genuine duplicate (a guard
+// whose target registration doc still exists), and orphaned-guard recovery (a guard whose target
+// registration doc was deleted, e.g. during test-data cleanup, without the guard being cleaned
+// up alongside it) — an orphaned guard is simply overwritten by tx.set() below rather than
+// needing a separate delete-then-retry pass.
+async function registerWithGuards(db, emailGuardRef, phoneGuardRef, regDocRef, registration) {
+  try {
+    return await db.runTransaction(async (tx) => {
+      // ALL reads must happen before any writes in a Firestore transaction, the SDK enforces this.
+      const [emailGuardSnap, phoneGuardSnap] = await Promise.all([tx.get(emailGuardRef), tx.get(phoneGuardRef)]);
+
+      for (const guardSnap of [emailGuardSnap, phoneGuardSnap]) {
+        if (!guardSnap.exists) continue;
+        const targetPath = guardSnap.get('regDocPath');
+        if (!isValidDocPath(targetPath)) {
+          // Malformed/corrupt guard: falls through and gets overwritten below like an orphan
+          // would, but this should never legitimately happen (only our own code writes these),
+          // so it's logged rather than silently swallowed.
+          console.warn('Malformed guard regDocPath, overwriting:', guardSnap.ref.path, targetPath);
+          continue;
+        }
+        const targetSnap = await tx.get(db.doc(targetPath));
+        if (targetSnap.exists) {
+          // Lost the race to a concurrent request that committed first (or a genuine earlier
+          // registration), that write is the real registration, this one is a no-op duplicate.
+          return { duplicate: true };
+        }
+        // else: orphaned guard, its target registration doc is gone, falls through and gets
+        // overwritten below instead of leaving this person permanently unable to register.
+      }
+
+      const guardData = { regDocPath: regDocRef.path, at: admin.firestore.FieldValue.serverTimestamp() };
+      // create() (hard "doesn't exist yet" server precondition) when the guard was absent at read
+      // time, that's the normal fresh-registration case and the one path where correctness must not
+      // rest on undocumented missing-document lock behavior. set() (plain overwrite) only when the
+      // guard existed-but-orphaned above, since that write is a deliberate replace, not a fresh create.
+      if (emailGuardSnap.exists) tx.set(emailGuardRef, guardData); else tx.create(emailGuardRef, guardData);
+      if (phoneGuardSnap.exists) tx.set(phoneGuardRef, guardData); else tx.create(phoneGuardRef, guardData);
+      tx.create(regDocRef, registration); // fresh auto-ID, should never collide, .create() as a safety assertion
+      return { duplicate: false };
+    });
+  } catch (err) {
+    // ALREADY_EXISTS (6): a concurrent transaction's create() on a guard we read as absent won
+    // the race between our read and our write. That's a genuine duplicate, not a real error.
+    // (In principle this could also fire from the regDocRef create() itself, a fresh auto-ID
+    // colliding, effectively impossible, but logged rather than silently swallowed either way.)
+    if (err?.code === 6) {
+      console.warn('registerWithGuards: ALREADY_EXISTS race, treating as duplicate:', err.message);
+      return { duplicate: true };
+    }
+    throw err;
+  }
 }
 
 router.post('/', async (req, res) => {
@@ -169,31 +266,18 @@ router.post('/', async (req, res) => {
     // Atomic duplicate guard: two near-simultaneous requests with the same email/phone can
     // both pass the findExistingRegistration() read above before either write commits. Email
     // is hashed rather than used as a raw document ID because EMAIL_RE permits "/" characters
-    // (e.g. "a/b@x.com"), which would corrupt the Firestore document path.
+    // (e.g. "a/b@x.com"), which would corrupt the Firestore document path. registerWithGuards()
+    // runs this as a single Firestore transaction, which is what actually guarantees no
+    // duplicates, regardless of what findExistingRegistration() found above, that query-based
+    // check is purely a cheap early-exit optimization, not the source of correctness. Whether
+    // this resolves as a fresh registration or a detected duplicate, the caller gets the same
+    // { success: true } response below, only a genuine unexpected error should produce a 500.
     const emailKey = crypto.createHash('sha256').update(clean.email).digest('hex');
     const regDocRef = db.collection('registrations').doc();
-    const batch = db.batch();
-    batch.create(db.collection('reg_uniq_email').doc(emailKey), {
-      regDocPath: regDocRef.path,
-      at: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    batch.create(db.collection('reg_uniq_phone').doc(clean.phone), {
-      regDocPath: regDocRef.path,
-      at: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    batch.create(regDocRef, registration);
+    const emailGuardRef = db.collection('reg_uniq_email').doc(emailKey);
+    const phoneGuardRef = db.collection('reg_uniq_phone').doc(clean.phone);
 
-    try {
-      await batch.commit();
-    } catch (e) {
-      if (e.code === 6 /* ALREADY_EXISTS */) {
-        // Lost the race to a concurrent request that committed first, that request's write is
-        // the real registration, this one is a no-op duplicate. Nothing further to look up
-        // since the response never includes ref/duplicate details either way.
-        return res.json({ success: true });
-      }
-      throw e;
-    }
+    await registerWithGuards(db, emailGuardRef, phoneGuardRef, regDocRef, registration);
 
     // AiSensy welcome message (wtl_welcome_referral) intentionally not sent here yet.
     // services/aisensy.js only exposes sendBroadcast(), a mass campaign broadcast to

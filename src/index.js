@@ -41,7 +41,9 @@ app.use(cors({
     if (!origin || ALLOWED_ORIGINS.includes(origin) || (origin.startsWith('https://') && origin.endsWith('.wiredtolaunch.pages.dev'))) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      const err = new Error('Not allowed by CORS');
+      err.status = 403;
+      callback(err);
     }
   },
   credentials: true,
