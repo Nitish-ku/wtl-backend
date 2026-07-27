@@ -74,8 +74,16 @@ app.use((err, req, res, next) => {
   res.status(status).json({ error: status < 500 ? err.message : 'Internal server error' });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Wired To Launch backend running on port ${PORT}`);
+});
+
+// Cloud Run sends SIGTERM before terminating an instance (new revision deploys, scale-down).
+// Node's default action is to exit immediately, which would drop any in-flight request (like a
+// registration mid-write). Stop accepting new connections and let existing ones finish first.
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, closing server gracefully');
+  server.close(() => process.exit(0));
 });
 
 module.exports = app;
